@@ -21,20 +21,61 @@ class HostDeviceMem(object):
 
     def __repr__(self):
         return self.__str__()
-def allocate_buffers(engine):
+
+
+def allocate_buffers_v2(engine, context):
+    """
+    Allocates host and device buffer for TRT engine inference.
+    This function is similiar to the one in ../../common.py, but
+    converts network outputs (which are np.float32) appropriately
+    before writing them to Python buffer. This is needed, since
+    TensorRT plugins doesn't support output type description, and
+    in our particular case, we use NMS plugin as network output.
+    Args:
+        engine (trt.ICudaEngine): TensorRT engine
+    Returns:
+        inputs [HostDeviceMem]: engine input memory
+        outputs [HostDeviceMem]: engine output memory
+        bindings [int]: buffer to device bindings
+        stream (cuda.Stream): cuda stream for engine inference synchronization
+    """
+    inputs = []
+    outputs = []
+    bindings = []
+    stream = cuda.Stream()
+    for i, binding in enumerate(engine):
+        # binding:input_ids,input_mask,output
+        # print(context.get_binding_shape(i)) # (input_ids,input_mask,output).shape (1,105)
+        size = trt.volume(context.get_binding_shape(i)) # 1*105
+        # dims = engine.get_binding_shape(binding)
+        # if dims[1] < 0:
+           # size *= -1
+        dtype = trt.nptype(engine.get_binding_dtype(binding)) # DataType.FLOAT
+        # print(dtype)  # <class 'numpy.float32'>
+        # Allocate host and device buffers
+        host_mem = cuda.pagelocked_empty(size, dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
+        # Append the device buffer to device bindings.
+        bindings.append(int(device_mem))
+        # Append to the appropriate list.
+        if engine.binding_is_input(binding):
+            inputs.append(HostDeviceMem(host_mem, device_mem))
+        else:
+            outputs.append(HostDeviceMem(host_mem, device_mem))
+    return inputs, outputs, bindings, stream
+def allocate_buffers(engine, len):
     inputs = []
     outputs = []
     bindings = []
     stream = cuda.Stream()
     for binding in engine:
-        size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
-        dims = engine.get_binding_shape(binding)
-        if dims[0] < 0:
-            size *= -1
+        print(engine.get_binding_shape(binding))
+        print(trt.volume(engine.get_binding_shape(binding)))
+        size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size * -1 * len
+        # size = len * engine.max_batch_size
         dtype = trt.nptype(engine.get_binding_dtype(binding))
         # Allocate host and device buffers
-        # 申请锁页内存
-        host_mem = cuda.pagelocked_empty(10, dtype)
+        host_mem = cuda.pagelocked_empty(size, dtype)
         device_mem = cuda.mem_alloc(host_mem.nbytes)
         # Append the device buffer to device bindings.
         bindings.append(int(device_mem))
@@ -97,7 +138,7 @@ def build_input_from_segments(history, reply, tokenizer, with_eos=True):
     return instance, sequence
 
 
-def sample_sequence(history, tokenizer, context, args, engine, inputs, outputs, bindings, stream, current_output=None):
+def sample_sequence(history, tokenizer, context, args, engine, current_output=None):
     special_tokens_ids = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS)
     if current_output is None:
         current_output = []
@@ -107,19 +148,19 @@ def sample_sequence(history, tokenizer, context, args, engine, inputs, outputs, 
         input_ids = torch.tensor(instance["input_ids"], dtype=torch.long, device=args.device).unsqueeze(0).cpu().numpy()
         token_type_ids = torch.tensor(instance["token_type_ids"], dtype=torch.long, device=args.device).unsqueeze(0).cpu().numpy()
 
-        context.active_optimization_profile = 0
+        #context.active_optimization_profile = 0
         origin_inputshape = context.get_binding_shape(0)
         origin_inputshape[0],origin_inputshape[1] = input_ids.shape
         context.set_binding_shape(0,(origin_inputshape))
         context.set_binding_shape(1,(origin_inputshape))
 
 
-        inputs, outputs, bindings, stream = common.allocate_buffers(engine)
-        inputs[1].host = input_ids
-        inputs[0].host = token_type_ids
+        inputs, outputs, bindings, stream = allocate_buffers_v2(engine, context)
+        inputs[0].host = input_ids.astype(np.float32)
+        inputs[1].host = token_type_ids.astype(np.float32)
 
         logits, *_= common.do_inference_v2(context,bindings = bindings, inputs= inputs, outputs=outputs, stream = stream)
-
+        logits = logits.reshape((1,input_ids.shape[1],13088))
 
 
 
@@ -172,11 +213,11 @@ def run():
         return list(tokenize(o) for o in obj)
     #模型加载
     runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-    with open("sample3.engine", "rb") as f:
+    with open("111.engine", "rb") as f:
         serialized_engine = f.read()
     engine = runtime.deserialize_cuda_engine(serialized_engine)
     context = engine.create_execution_context()
-    inputs, outputs, bindings, stream = allocate_buffers(engine)
+    #inputs, outputs, bindings, stream = allocate_buffers(engine)
     # output_name = []
     # for node in model.get_outputs():
     #     output_name.append(node.name)
@@ -190,7 +231,7 @@ def run():
         raw_text = " ".join(list(raw_text.replace(" ", "")))
         history.append(tokenize(raw_text))
         with torch.no_grad():
-            out_ids = sample_sequence(history, tokenizer, context, args, engine, inputs, outputs, bindings, stream)
+            out_ids = sample_sequence(history, tokenizer, context, args, engine)
         history.append(out_ids)
         history = history[-(2 * args.max_history + 1):]
         out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
